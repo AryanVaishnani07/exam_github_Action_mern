@@ -1,4 +1,4 @@
-name: Full Auto Deploy MERN to EC2
+name: Auto Deploy MERN App to EC2
 
 on:
   push:
@@ -10,87 +10,138 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ---------------- CHECKOUT ----------------
-      - name: Checkout code
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      # ---------------- DOCKER HUB LOGIN ----------------
-      - name: Login to Docker Hub
+      - name: Setup SSH
         run: |
-          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login \
-            -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p ${{ secrets.EC2_PORT }} ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
-      # ---------------- BUILD & PUSH BACKEND ----------------
-      - name: Build & Push Backend
+      - name: Full Server Setup + MongoDB Config
         run: |
-          docker build -t ${{ secrets.DOCKER_USERNAME }}/backend:latest ./backend
-          docker push ${{ secrets.DOCKER_USERNAME }}/backend:latest
+          ssh -p ${{ secrets.EC2_PORT }} ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+          set -e
 
-      # ---------------- BUILD & PUSH FRONTEND ----------------
-      - name: Build & Push Frontend
+          echo "===== UPDATE SERVER ====="
+          sudo apt update -y
+
+          echo "===== INSTALL NGINX ====="
+          if ! command -v nginx >/dev/null 2>&1; then
+            sudo apt install -y nginx
+            sudo systemctl enable nginx
+          fi
+
+          echo "===== INSTALL NODEJS ====="
+          if ! command -v node >/dev/null 2>&1; then
+            curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+            sudo apt install -y nodejs
+          fi
+
+          echo "===== INSTALL PM2 ====="
+          if ! command -v pm2 >/dev/null 2>&1; then
+            sudo npm install -g pm2
+          fi
+
+          echo "===== INSTALL MONGODB 7.0 ====="
+          if ! command -v mongod >/dev/null 2>&1; then
+            curl -fsSL https://pgp.mongodb.com/server-7.0.asc | \
+            sudo gpg -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor
+
+            echo "deb [ arch=amd64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | \
+            sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
+
+            sudo apt update -y
+            sudo apt install -y mongodb-org
+          fi
+
+          echo "===== ENABLE MONGODB ====="
+          sudo systemctl enable mongod
+          sudo systemctl stop mongod || true
+
+          echo "===== CONFIGURE MONGODB ====="
+          sudo bash -c 'cat > /etc/mongod.conf <<CONFIG
+          storage:
+            dbPath: /var/lib/mongodb
+
+          systemLog:
+            destination: file
+            logAppend: true
+            path: /var/log/mongodb/mongod.log
+
+          net:
+            port: 27017
+            bindIp: 0.0.0.0
+
+          processManagement:
+            timeZoneInfo: /usr/share/zoneinfo
+
+          security:
+            authorization: enabled
+          CONFIG'
+
+          echo "===== START MONGODB ====="
+          sudo systemctl daemon-reload
+          sudo systemctl restart mongod
+          sleep 10
+
+          echo "===== CHECK STATUS ====="
+          sudo systemctl status mongod --no-pager || true
+
+          echo "===== CREATE ADMIN USER ====="
+          mongosh admin --eval '
+            try {
+              db.createUser({
+                user: "mscgu",
+                pwd: "mscgu2025",
+                roles: [{ role: "root", db: "admin" }]
+              });
+              print("User Created");
+            } catch(e) {
+              print("User Already Exists");
+            }
+          ' || true
+
+          echo "===== RESTART AFTER USER ====="
+          sudo systemctl restart mongod
+          sleep 5
+
+          mkdir -p /home/ubuntu/app
+          EOF
+
+      - name: Upload Project Files
         run: |
-          docker build -t ${{ secrets.DOCKER_USERNAME }}/frontend:latest ./frontend
-          docker push ${{ secrets.DOCKER_USERNAME }}/frontend:latest
+          scp -P ${{ secrets.EC2_PORT }} -r frontend backend \
+          ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/home/ubuntu/app/
 
-      # ---------------- DEPLOY TO EC2 ----------------
-      - name: Install Docker & Run Containers on EC2
-        uses: appleboy/ssh-action@v1.0.0
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_KEY }}
-          script: |
-            set -e
+      - name: Run Backend + Frontend
+        run: |
+          ssh -p ${{ secrets.EC2_PORT }} ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+          set -e
 
-            echo " Starting deployment..."
+          echo "===== BACKEND ====="
+          cd /home/ubuntu/app/backend
 
-            # -------- INSTALL DOCKER --------
-            if ! command -v docker &> /dev/null
-            then
-              sudo apt update -y
-              sudo apt install docker.io -y
-              sudo systemctl start docker
-              sudo systemctl enable docker
-            fi
+          npm install
 
-            # -------- DOCKER LOGIN --------
-            echo "${{ secrets.DOCKER_PASSWORD }}" | sudo docker login \
-              -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+          echo "PORT=5000" > .env
+          echo "MONGO_URI=mongodb://mscgu:mscgu2025@${{ secrets.EC2_HOST }}:27017/mscgu?authSource=admin" >> .env
 
-            # -------- NETWORK --------
-            sudo docker network create mern-network || true
+          pm2 delete backend-app || true
+          pm2 start server.js --name backend-app
+          pm2 save
 
-            # -------- MONGO --------
-            sudo docker stop mongo || true
-            sudo docker rm mongo || true
-            sudo docker run -d \
-              --name mongo \
-              --network mern-network \
-              --restart always \
-              -p 27017:27017 \
-              -v mongo_data:/data/db \
-              mongo
+          echo "===== FRONTEND ====="
+          cd /home/ubuntu/app/frontend
+          npm install
+          npm run build
 
-            # -------- BACKEND --------
-            sudo docker pull ${{ secrets.DOCKER_USERNAME }}/backend:latest
-            sudo docker stop backend || true
-            sudo docker rm backend || true
-            sudo docker run -d \
-              --name backend \
-              --network mern-network \
-              --restart always \
-              -p 5000:5000 \
-              -e MONGO_URL=mongodb://mongo:27017/mern_demo \
-              ${{ secrets.DOCKER_USERNAME }}/backend:latest
+          sudo rm -rf /var/www/html/*
+          sudo cp -r build/* /var/www/html/
 
-            # -------- FRONTEND --------
-            sudo docker pull ${{ secrets.DOCKER_USERNAME }}/frontend:latest
-            sudo docker stop frontend || true
-            sudo docker rm frontend || true
-            sudo docker run -d \
-              --name frontend \
-              --restart always \
-              -p 3000:3000 \
-              ${{ secrets.DOCKER_USERNAME }}/frontend:latest
+          sudo systemctl restart nginx
 
-            echo "Deployment completed successfully"
+          echo "===== DEPLOY SUCCESS ====="
+          EOF
